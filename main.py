@@ -32,8 +32,6 @@ from PIL import Image
 from torchvision import datasets, transforms
 from torchvision.models import vgg16, VGG16_Weights  # type: ignore
 from pytorch_msssim import ssim  # type: ignore
-import lpips  # type: ignore
-from pytorch_wavelets import DWTForward, DWTInverse  # type: ignore
 
 # ---------------------------------------------------------------------------------
 # Synthetic data — coloured discs --------------------------------------------------
@@ -118,8 +116,6 @@ class CIFAR10Dataset(Dataset):
                  download: bool = True):
         super().__init__()
         transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomAffine(degrees=8, translate=(0.05, 0.05)),
             transforms.Resize(hr, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.ToTensor(),
         ])
@@ -154,64 +150,55 @@ def downsample(x: torch.Tensor) -> torch.Tensor:
         x = x.squeeze(0)
     return x
 
-# Default scale per step (√2 ≈ 1.414) – can be tweaked globally or via CLI later.
-UPSCALE_FACTOR = 2.0
-MIN_RES = 4  # coarse root resolution
 
-def make_pyramid(hr: torch.Tensor, *, factor: float = UPSCALE_FACTOR, min_size: int = MIN_RES) -> List[torch.Tensor]:
-    """Return list of images from *coarsest* → HR using geometric scale *factor*.
-
-    The last element equals *hr* itself. Assumes square inputs.
-    """
-    H = hr.shape[-1]
-    sizes: List[int] = [min_size]
-    # Build ascending size list until we reach HR
-    while sizes[-1] < H:
-        nxt = max(sizes[-1] + 1, int(round(sizes[-1] * factor)))  # avoid duplicates
-        sizes.append(min(H, nxt))
-    sizes[-1] = H  # ensure exact HR
-
-    pyr: List[torch.Tensor] = []
-    for s in sizes:
-        if s == H:
-            pyr.append(hr)
-        else:
-            pyr.append(F.interpolate(hr, size=(s, s), mode="area"))
-    return pyr  # coarse(first) → fine(last)
+def make_pyramid(hr: torch.Tensor, levels: int = 4) -> List[torch.Tensor]:
+    pyr = [hr]
+    for _ in range(levels):
+        pyr.insert(0, downsample(pyr[0]))
+    return pyr  # [4²,8²,16²,32²,64²]
 
 # ---------------------------------------------------------------------------------
 # Fourier Neural Operator layer ----------------------------------------------
 # ---------------------------------------------------------------------------------
 
-class WaveletConv2d(nn.Module):
-    """Wavelet-domain operator: 1-level Haar DWT → 1×1 conv on coeffs → IDWT."""
-
-    def __init__(self, in_ch: int, out_ch: int, wave: str = "haar"):
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_ch, out_ch, modes):
         super().__init__()
-        self.in_ch, self.out_ch = in_ch, out_ch
-        self.dwt = DWTForward(J=1, wave=wave, mode="zero")
-        self.idwt = DWTInverse(wave=wave, mode="zero")
+        self.in_ch, self.out_ch, self.modes = in_ch, out_ch, modes
+        self.scale = 1 / (in_ch * out_ch)
+        self.weight = nn.Parameter(self.scale * torch.randn(in_ch, out_ch, modes, modes, 2))
 
-        # Conv on LL
-        self.conv_ll = nn.Conv2d(in_ch, out_ch, 1)
-        # Conv on stacked high-pass bands (LH, HL, HH) flattened to channel dim
-        self.conv_hp = nn.Conv2d(in_ch * 3, out_ch * 3, 1)
+    def compl_mul(self, a, w):
+        ar, ai = a[..., 0], a[..., 1]
+        wr, wi = w[..., 0], w[..., 1]
+        real = torch.einsum("bihw,iohw->bohw", ar, wr) - torch.einsum("bihw,iohw->bohw", ai, wi)
+        imag = torch.einsum("bihw,iohw->bohw", ar, wi) + torch.einsum("bihw,iohw->bohw", ai, wr)
+        return torch.stack([real, imag], dim=-1)
 
-    def forward(self, x):
-        B, C, H, W = x.shape
-        ll, hp_list = self.dwt(x)  # hp_list[0]: (B,C,3,H/2,W/2)
-        hp = hp_list[0]
+    def forward(self, x):  # x: (b,c,h,w)
+        B, _, H, W = x.shape
 
-        ll_out = self.conv_ll(ll)
+        # Forward FFT (real-to-complex) and convert to real-imag pair
+        x_ft = torch.fft.rfftn(x, dim=[-2, -1])
+        x_ft = torch.view_as_real(x_ft)  # (B, C, H, W//2+1, 2)
 
-        hp_flat = rearrange(hp, "b c o h w -> b (c o) h w")
-        hp_out_flat = self.conv_hp(hp_flat)
-        hp_out = rearrange(hp_out_flat, "b (c o) h w -> b c o h w", o=3, c=self.out_ch)
+        # Limit the number of Fourier modes to those available in the input to
+        # avoid size mismatches when H or W is smaller than self.modes.
+        Hm = min(self.modes, H)
+        Wm = min(self.modes, W // 2 + 1)
 
-        x_rec = self.idwt((ll_out, [hp_out]))
-        # Ensure same spatial size (idwt pads to even)
-        x_rec = x_rec[..., :H, :W]
-        return x_rec
+        out_ft = torch.zeros(B, self.out_ch, H, W // 2 + 1, 2, device=x.device, dtype=x.dtype)
+
+        # Multiply only the retained modes.
+        out_ft[:, :, :Hm, :Wm] = self.compl_mul(
+            x_ft[:, :, :Hm, :Wm],
+            self.weight[:, :, :Hm, :Wm],
+        )
+
+        # Inverse FFT back to spatial domain
+        out_ft = torch.view_as_complex(out_ft)
+        x = torch.fft.irfftn(out_ft, s=(H, W), dim=[-2, -1])
+        return x
 
 class FNO_Double(nn.Module):
     """Recursive FNO block for *next-scale prediction*.
@@ -228,20 +215,20 @@ class FNO_Double(nn.Module):
         self,
         *,
         width: int = 96,
-        modes: int = 28,
+        modes: int = 42,
         layers: int = 4,
-        noise_ch: int = 4,
+        noise_ch: int = 1,
         concat_coords: bool = True,
     ):
         super().__init__()
         self.noise_ch = noise_ch
         self.concat_coords = concat_coords
 
-        in_ch = 3 + noise_ch + (2 if concat_coords else 0) + 3  # skip connection
+        in_ch = 3 + noise_ch + (2 if concat_coords else 0)
         self.in_proj = nn.Conv2d(in_ch, width, kernel_size=1)
 
         # A *single* spectral convolution shared across layers (true weight-tying).
-        self.spec = WaveletConv2d(width, width)
+        self.spec = SpectralConv2d(width, width, modes)
 
         # Decide number of groups for GroupNorm.
         ng = max(1, min(8, width // 16))
@@ -251,10 +238,9 @@ class FNO_Double(nn.Module):
             self.layers.append(
                 nn.ModuleDict(
                     {
-                        "dense": nn.Conv2d(width, width, 1),
-                        # two depth-wise 3×3 convs for local edges
-                        "local1": nn.Conv2d(width, width, 3, padding=1, groups=width),
-                        "local2": nn.Conv2d(width, width, 3, padding=1, groups=width),
+                    "dense": nn.Conv2d(width, width, 1),
+                        # depth-wise 3×3 conv captures local edges; followed by pointwise fuse
+                        "local": nn.Conv2d(width, width, 3, padding=1, groups=width),
                         "norm": nn.GroupNorm(ng, width),
                     }
                 )
@@ -287,17 +273,12 @@ class FNO_Double(nn.Module):
         feats = [upsampled, noise]
         if self.concat_coords:
             feats.append(self._coord_grid(B, H, W, upsampled.device, upsampled.dtype))
-        # Add skip connection from original LR image (upsampled to current size)
-        if hasattr(self, 'orig_lr') and self.orig_lr is not None:
-            feats.append(F.interpolate(self.orig_lr, size=(H, W), mode="nearest"))
-        else:
-            feats.append(torch.zeros(B, 3, H, W, device=upsampled.device, dtype=upsampled.dtype))
         x = torch.cat(feats, dim=1)                          # (B,C,H,W)
 
         x = F.gelu(self.in_proj(x))
         residual_scale = 0.5
         for block in self.layers:
-            delta = self.spec(x) + block["dense"](x) + block["local1"](x) + block["local2"](x)
+            delta = self.spec(x) + block["dense"](x) + block["local"](x)
             x = x + residual_scale * delta
             x = block["norm"](x)
             x = F.gelu(x)
@@ -376,8 +357,8 @@ class PatchDiscriminator(nn.Module):
 
 def train_epoch(model, loader, opt, device, epoch: int | None = None,
                *, disc: Optional[nn.Module] = None, disc_opt: Optional[torch.optim.Optimizer] = None,
-               lambda_vgg: float = 0.3, lambda_ssim: float = 0.8, lambda_grad: float = 0.2,
-               lambda_lap: float = 0.1, lambda_adv: float = 0.01, lambda_lpips: float = 0.2, integer_upsample: bool = False):
+               lambda_vgg: float = 0.1, lambda_ssim: float = 0.8, lambda_grad: float = 0.2,
+               lambda_lap: float = 0.1, lambda_adv: float = 1e-3):
     """Run one training epoch and return average L1 loss.
 
     Progress is displayed with a tqdm bar. If *epoch* is provided, it will be
@@ -392,40 +373,37 @@ def train_epoch(model, loader, opt, device, epoch: int | None = None,
 
     for hr in pbar:
         hr = hr.to(device)
-        pyr = make_pyramid(hr)
-        # Save original LR for skip connection
-        model.orig_lr = pyr[0].to(device)
+        pyr = make_pyramid(hr)  # [4,8,16,32,64]
         loss = 0
         wt = 1
         max_lvl = len(pyr) - 2  # index of 64×64 prediction step
         for lvl in range(len(pyr) - 1):
             lr = pyr[lvl]
             gt = pyr[lvl + 1]
-            up_mode = "nearest" if not integer_upsample else ("nearest" if gt.shape[-1] % lr.shape[-1] == 0 else "bilinear")
-            up = F.interpolate(lr, size=gt.shape[-2:], mode=up_mode)
+            up = F.interpolate(lr, size=gt.shape[-2:], mode="bilinear")
             noise = torch.zeros(hr.size(0), model.noise_ch, gt.shape[-2], gt.shape[-1], device=hr.device, dtype=hr.dtype)
             pred = model(up, noise=noise)
             l1 = F.l1_loss(pred, gt)
             loss += wt * l1
 
-            if lvl == max_lvl and (lambda_vgg > 0 or lambda_ssim > 0 or lambda_lpips > 0):
+            if lvl == max_lvl and (lambda_vgg > 0 or lambda_ssim > 0):
                 # High-res perceptual & MS-SSIM losses
                 if lambda_vgg > 0:
                     vgg = _get_vgg_feat(device)
                     feat_pred = vgg(pred)
                     feat_gt = vgg(gt)
+                    # print("vgg loss", F.l1_loss(feat_pred, feat_gt.detach()))
                     loss += lambda_vgg * F.l1_loss(feat_pred, feat_gt.detach())
+
                 if lambda_ssim > 0:
                     ssim_loss = 1 - ssim(pred, gt, data_range=1.0, size_average=True)
                     loss += lambda_ssim * ssim_loss
+
                 if lambda_grad > 0:
                     gx_p, gy_p = _gradients(pred)
                     gx_g, gy_g = _gradients(gt)
                     grad_loss = F.l1_loss(gx_p, gx_g) + F.l1_loss(gy_p, gy_g)
                     loss += lambda_grad * grad_loss
-                if lambda_lpips > 0:
-                    lpips_loss = lpips.LPIPS(net='vgg').to(device).eval()
-                    loss += lambda_lpips * lpips_loss(pred, gt).mean()
 
             if lambda_lap > 0 and lvl == max_lvl:
                 lap_pred = _laplacian_pyramid(pred, 3)
@@ -461,8 +439,6 @@ def train_epoch(model, loader, opt, device, epoch: int | None = None,
         pbar.set_postfix({"batch_L1": f"{batch_loss:.4f}",
                           "avg_L1": f"{total_loss / num_samples:.4f}"})
 
-    # Remove skip connection after epoch
-    model.orig_lr = None
     return total_loss / num_samples
 
 
@@ -518,57 +494,45 @@ def generate_samples(
     """
     model.eval()
     outdir.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(n, 6 if val_ds else 5, figsize=(10 if val_ds else 8, n * 1.6))
 
-    # Determine column count beforehand using the step schedule
-    base_steps: List[int] = []
-    cur = MIN_RES
-    while cur < 64:
-        cur = min(64, int(round(cur * UPSCALE_FACTOR)))
-        base_steps.append(cur)
-
-    n_cols = len(base_steps) + (2 if val_ds else 1)
-
-    fig, axes = plt.subplots(n, n_cols, figsize=(n_cols * 1.6, n * 1.6))
     rng = np.random.default_rng()
 
     with torch.no_grad():
         for i in tqdm(range(n), desc="Sampling"):
-            # --- seed image ---
             if val_ds is not None:
+                # --- seed from validation HR image ---
                 idx = int(rng.integers(0, len(val_ds)))
-                hr_img = val_ds[idx].to(device)
-                x = F.interpolate(hr_img.unsqueeze(0), size=(MIN_RES, MIN_RES), mode="area")
-                imgs = [hr_img.cpu()]
+                hr_img = val_ds[idx]  # returns (3,64,64) tensor normalised 0-1
+                hr_img = hr_img.to(device)
+                x = F.interpolate(hr_img.unsqueeze(0), size=(4, 4), mode="area")
+                imgs = [hr_img.cpu()]  # ground truth reference
+                col_titles = ["GT 64×64", "bilinear↑4", "8×8", "16×16", "32×32", "64×64"]
             else:
-                x = torch.rand(1, 3, MIN_RES, MIN_RES, device=device)
-                imgs = []
+                x = torch.rand(1, 3, 4, 4, device=device)
+                imgs = [F.interpolate(x, 64, mode="bilinear").cpu().squeeze(0)]
+                col_titles = ["bilinear↑4", "8×8", "16×16", "32×32", "64×64"]
 
-            # Nearest-up to 64 for baseline
-            imgs.append(F.interpolate(x, 64, mode="nearest").cpu().squeeze(0))
+                # For the noise-seed case we already have the bilinear-up image
+                # as the first panel, so we *do not* append another copy.
+                pass
 
-            # Save intermediate outputs
-            intermediates = []
-            sigmas = np.geomspace(0.4, 0.05, num=len(base_steps))
-            for new_size, s in zip(base_steps, sigmas):
-                up = F.interpolate(x, size=new_size, mode="nearest")
-                x = model(up, sigma=float(s))
-                imgs.append(x.cpu().squeeze(0))
-                intermediates.append(x.cpu().squeeze(0))
-            # Optionally: save intermediates to disk for debugging
-            # for k, im in enumerate(intermediates):
-            #     torchvision.utils.save_image(im, outdir / f"sample_{i}_step_{k}.png")
-
-            # Titles
+            # For the val-seed case we still need to add the bilinear-up baseline
             if val_ds is not None:
-                titles = ["GT"] + ["nearest↑64"] + [f"{sz}×{sz}" for sz in base_steps]
-            else:
-                titles = ["nearest↑64"] + [f"{sz}×{sz}" for sz in base_steps]
+                imgs.append(F.interpolate(x, 64, mode="bilinear").cpu().squeeze(0))
+
+            # Autoregressive upscales (4 steps: 4→8→16→32→64)
+            sigmas = [0.4, 0.2, 0.1, 0.05]  # for the 4 upscales (4→8→…→64)
+            for s in sigmas:
+                up = F.interpolate(x, scale_factor=2, mode="bilinear")
+                x = model(up, sigma=s)
+                imgs.append(x.cpu().squeeze(0))
 
             for j, img in enumerate(imgs):
                 axes[i, j].imshow(rearrange(img, "c h w -> h w c"))
                 axes[i, j].axis("off")
                 if i == 0:
-                    axes[0, j].set_title(titles[j], fontsize=8)
+                    axes[0, j].set_title(col_titles[j], fontsize=9)
 
     plt.tight_layout()
     plt.savefig(outdir / "cf_samples.png")
@@ -586,10 +550,10 @@ def main():
     train_ds = CIFAR10Dataset(split="train", hr=64, download=True)
     val_ds = CIFAR10Dataset(split="val", hr=64, download=True)
 
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=256, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=0, pin_memory=True)
 
-    model = FNO_Double(width=192, modes=16, layers=6).to(device)
+    model = FNO_Double(width=192, modes=42, layers=6).to(device)
 
     disc = PatchDiscriminator().to(device)
 
@@ -604,7 +568,7 @@ def main():
     epoch_iter = tqdm(range(1, 25 + 1), desc="Epochs")
     for epoch in epoch_iter:
         tr = train_epoch(model, train_loader, opt, device, epoch,
-                          disc=disc, disc_opt=disc_opt, lambda_vgg=0.3, lambda_adv=0.01, lambda_lpips=0.2, integer_upsample=True)
+                          disc=disc, disc_opt=disc_opt)
         vl, ps = validate(model, val_loader, device, epoch)
 
         train_hist.append(tr)
